@@ -1,0 +1,25 @@
+# Node
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build/output
+dist/
+build/
+coverage/
+
+# Env
+.env
+.env.*
+
+# Temp/editor
+tmp/
+.cache/
+*.swp
+*.swo
+.DS_Store
