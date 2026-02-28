@@ -160,7 +160,7 @@ while true; do
 done
 ```
 
-**For PR policy**: write a simpler finish script that pushes the branch and prints a URL or instructions:
+**For PR policy**: write a finish script that pushes the branch and opens a PR via the `gh` CLI:
 
 ```bash
 #!/usr/bin/env bash
@@ -170,12 +170,11 @@ AGENT_ID="${PI_PARALLEL_AGENT_ID:-${1:-unknown}}"
 MAIN_BRANCH="MAIN_BRANCH_VALUE"
 BRANCH="$(git branch --show-current)"
 
-echo "[parallel-agent-finish] Pushing $BRANCH for pull request..."
+echo "[parallel-agent-finish] Pushing $BRANCH..."
 git push -u origin "$BRANCH"
 
-echo ""
-echo "[parallel-agent-finish] Branch pushed. Open a PR against $MAIN_BRANCH:"
-echo "  https://github.com/$(git remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||')/compare/$MAIN_BRANCH...$BRANCH"
+echo "[parallel-agent-finish] Opening pull request against $MAIN_BRANCH..."
+gh pr create --base "$MAIN_BRANCH" --head "$BRANCH" --fill
 ```
 
 ---
@@ -222,7 +221,7 @@ PI_PARALLEL_PARENT_REPO="$PI_PARALLEL_PARENT_REPO" .pi/parallel-agent-finish.sh
 ```markdown
 ---
 name: finish
-description: Finalize a parallel-agent branch by pushing and opening a PR, after explicit user approval (e.g. LGTM).
+description: Finalize a parallel-agent branch by pushing and opening a PR via gh CLI, after explicit user approval (e.g. LGTM).
 ---
 
 # Parallel-agent finish workflow
@@ -231,15 +230,13 @@ When the user explicitly approves the work (e.g. says "LGTM", "ship it"):
 
 1. **Confirm** with user before pushing.
 
-2. Run the finish script to push and get a PR URL:
+2. Run the finish script to push the branch and open a PR automatically:
 
 ```bash
 .pi/parallel-agent-finish.sh
 ```
 
-3. Share the PR URL with the user.
-
-4. Suggest `/quit` if no further work is needed.
+3. Suggest `/quit` if no further work is needed.
 ```
 
 ---
