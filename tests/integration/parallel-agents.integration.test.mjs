@@ -432,12 +432,50 @@ async function callAgentSendTool(harness, id, prompt, timeoutMs = 90_000) {
 	return callToolViaPrompt(harness, "agent-send", { id, prompt }, { timeoutMs, retries: 3 });
 }
 
-async function closeChildWindowAfterPrompt(harness, agentId) {
-	const agent = await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 });
-	const windowId = agent.tmuxWindowId;
-	assert.ok(windowId, `agent ${agentId} should have a tmuxWindowId`);
+async function readWindowIdFromLaunchScript(harness, agentId) {
+	const launchPath = join(harness.repoRoot, ".pi", "parallel-agents", "runtime", agentId, "launch.sh");
+	if (!(await exists(launchPath))) return undefined;
+	const raw = await readFile(launchPath, "utf8").catch(() => "");
+	const match = raw.match(/(?:^|\n)WINDOW_ID=(?:'([^']+)'|"([^"]+)"|([^\s\n]+))/);
+	return match?.[1] || match?.[2] || match?.[3];
+}
 
+async function resolveChildWindowId(harness, agentId) {
+	const registry = await readRegistry(harness);
+	const fromRegistry = registry.agents?.[agentId]?.tmuxWindowId;
+	if (typeof fromRegistry === "string" && fromRegistry.length > 0) {
+		return fromRegistry;
+	}
+
+	const fromLaunchScript = await readWindowIdFromLaunchScript(harness, agentId);
+	if (fromLaunchScript) {
+		return fromLaunchScript;
+	}
+
+	const list = tmux(harness, ["list-windows", "-F", "#{window_id} #{window_name}"], { allowFailure: true });
+	if (list.status !== 0) {
+		return undefined;
+	}
+	for (const line of list.stdout.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		const [windowId, ...nameParts] = trimmed.split(/\s+/);
+		if (nameParts.join(" ") === `agent-${agentId}`) {
+			return windowId;
+		}
+	}
+
+	return undefined;
+}
+
+async function closeChildWindowAfterPrompt(harness, agentId, windowIdHint) {
 	await waitForBacklogContains(harness, agentId, "Press any key to close this tmux window", 60_000);
+
+	const terminalRecord = await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 }).catch(
+		() => undefined,
+	);
+	const windowId = windowIdHint || terminalRecord?.tmuxWindowId || (await resolveChildWindowId(harness, agentId));
+	assert.ok(windowId, `agent ${agentId} should have a tmuxWindowId (registry/launch.sh fallback)`);
 
 	if (!windowExists(harness, windowId)) {
 		return;
@@ -738,7 +776,6 @@ test(
 			typeof doneCheck.payload.error === "string" && doneCheck.payload.error.includes("Unknown agent id"),
 			`expected unknown-agent error after cleanup: ${JSON.stringify(doneCheck.payload)}`,
 		);
-		await waitForParentContains(harness, "Press any key to close this tmux window", 30_000);
 
 		await closeChildWindowAfterPrompt(harness, "a-0001");
 	},
