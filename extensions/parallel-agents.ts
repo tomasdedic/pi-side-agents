@@ -15,6 +15,7 @@ const ENV_RUNTIME_DIR = "PI_PARALLEL_RUNTIME_DIR";
 const STATUS_KEY = "parallel-agents";
 const REGISTRY_VERSION = 1;
 const CHILD_LINK_ENTRY_TYPE = "parallel-agent-link";
+const STATUS_UPDATE_MESSAGE_TYPE = "parallel-agent-status";
 
 const SUMMARY_SYSTEM_PROMPT = `You are writing a handoff summary for a background coding agent.
 
@@ -120,9 +121,18 @@ type CommandResult = {
 	error?: string;
 };
 
+type StatusTransitionNotice = {
+	id: string;
+	fromStatus: AgentStatus;
+	toStatus: AgentStatus;
+	tmuxWindowIndex?: number;
+};
+
 let statusPollTimer: NodeJS.Timeout | undefined;
 let statusPollContext: ExtensionContext | undefined;
+let statusPollApi: ExtensionAPI | undefined;
 let statusPollInFlight = false;
+const statusSnapshotsByStateRoot = new Map<string, Map<string, AgentStatus>>();
 
 function nowIso() {
 	return new Date().toISOString();
@@ -152,7 +162,6 @@ function isTerminalStatus(status: AgentStatus): boolean {
 	return status === "done" || status === "failed" || status === "crashed";
 }
 
-const STATUS_TRANSITION_PREFIX = "[parallel-agent][status]";
 const TASK_PREVIEW_MAX_CHARS = 220;
 const BACKLOG_LINE_MAX_CHARS = 240;
 const BACKLOG_TOTAL_MAX_CHARS = 2400;
@@ -160,49 +169,12 @@ const ANSI_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const ANSI_OSC_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
 const CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
-function resolveBacklogPathForRecord(stateRoot: string, record: AgentRecord): string {
-	if (record.logPath) return record.logPath;
-	if (record.runtimeDir) return join(record.runtimeDir, "backlog.log");
-	return join(getRuntimeDir(stateRoot, record.id), "backlog.log");
-}
-
-async function appendStatusTransitionToBacklog(
-	stateRoot: string,
-	record: AgentRecord,
-	fromStatus: AgentStatus,
-	toStatus: AgentStatus,
-	changedAt: string,
-): Promise<void> {
-	if (fromStatus === toStatus) return;
-
-	const backlogPath = resolveBacklogPathForRecord(stateRoot, record);
-	const line = `${STATUS_TRANSITION_PREFIX} ${changedAt} ${record.id}: ${fromStatus} -> ${toStatus}\n`;
-
-	try {
-		await ensureDir(dirname(backlogPath));
-		await fs.appendFile(backlogPath, line, "utf8");
-		record.logPath = record.logPath ?? backlogPath;
-		record.runtimeDir = record.runtimeDir ?? dirname(backlogPath);
-	} catch {
-		// Best effort only; status updates must not fail if backlog append fails.
-	}
-}
-
-async function setRecordStatus(
-	stateRoot: string,
-	record: AgentRecord,
-	nextStatus: AgentStatus,
-	options?: { logTransition?: boolean },
-): Promise<boolean> {
+async function setRecordStatus(_stateRoot: string, record: AgentRecord, nextStatus: AgentStatus): Promise<boolean> {
 	const previousStatus = record.status;
 	if (previousStatus === nextStatus) return false;
 
-	const changedAt = nowIso();
 	record.status = nextStatus;
-	record.updatedAt = changedAt;
-	if (options?.logTransition ?? true) {
-		await appendStatusTransitionToBacklog(stateRoot, record, previousStatus, nextStatus, changedAt);
-	}
+	record.updatedAt = nowIso();
 	return true;
 }
 
@@ -1570,7 +1542,7 @@ async function setChildRuntimeStatus(ctx: ExtensionContext, nextStatus: AgentSta
 			return;
 		}
 
-		const changed = await setRecordStatus(stateRoot, record, nextStatus, { logTransition: false });
+		const changed = await setRecordStatus(stateRoot, record, nextStatus);
 		if (!changed) {
 			record.updatedAt = nowIso();
 		}
@@ -1672,7 +1644,7 @@ async function ensureChildSessionLinked(pi: ExtensionAPI, ctx: ExtensionContext)
 		existing.parentSessionId = existing.parentSessionId ?? parentSession;
 		let statusChanged = false;
 		if (!isTerminalStatus(existing.status)) {
-			statusChanged = await setRecordStatus(stateRoot, existing, "running", { logTransition: false });
+			statusChanged = await setRecordStatus(stateRoot, existing, "running");
 		}
 		if (!statusChanged) {
 			existing.updatedAt = nowIso();
@@ -1702,12 +1674,91 @@ async function ensureChildSessionLinked(pi: ExtensionAPI, ctx: ExtensionContext)
 	}
 }
 
-async function renderStatusLine(ctx: ExtensionContext): Promise<void> {
+function isChildRuntime(): boolean {
+	return Boolean(process.env[ENV_AGENT_ID]);
+}
+
+function collectStatusTransitions(stateRoot: string, agents: AgentRecord[]): StatusTransitionNotice[] {
+	const previous = statusSnapshotsByStateRoot.get(stateRoot);
+	const next = new Map<string, AgentStatus>();
+	const transitions: StatusTransitionNotice[] = [];
+
+	for (const record of agents) {
+		next.set(record.id, record.status);
+		const previousStatus = previous?.get(record.id);
+		if (!previousStatus || previousStatus === record.status) continue;
+		transitions.push({
+			id: record.id,
+			fromStatus: previousStatus,
+			toStatus: record.status,
+			tmuxWindowIndex: record.tmuxWindowIndex,
+		});
+	}
+
+	statusSnapshotsByStateRoot.set(stateRoot, next);
+	if (!previous) return [];
+	return transitions;
+}
+
+function transitionNotifyLevel(status: AgentStatus): "info" | "warning" | "error" {
+	switch (status) {
+		case "failed":
+		case "crashed":
+			return "error";
+		case "waiting_merge_lock":
+		case "retrying_reconcile":
+			return "warning";
+		default:
+			return "info";
+	}
+}
+
+function formatStatusTransitionMessage(transition: StatusTransitionNotice): string {
+	const win = transition.tmuxWindowIndex !== undefined ? ` (tmux #${transition.tmuxWindowIndex})` : "";
+	return `parallel-agent ${transition.id}: ${transition.fromStatus} -> ${transition.toStatus}${win}`;
+}
+
+function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, transitions: StatusTransitionNotice[]): void {
+	if (isChildRuntime()) return;
+
+	for (const transition of transitions) {
+		const message = formatStatusTransitionMessage(transition);
+		if (ctx.hasUI) {
+			ctx.ui.notify(message, transitionNotifyLevel(transition.toStatus));
+		}
+		pi.sendMessage(
+			{
+				customType: STATUS_UPDATE_MESSAGE_TYPE,
+				content: message,
+				display: false,
+				details: {
+					agentId: transition.id,
+					fromStatus: transition.fromStatus,
+					toStatus: transition.toStatus,
+					tmuxWindowIndex: transition.tmuxWindowIndex,
+					emittedAt: Date.now(),
+				},
+			},
+			{ triggerTurn: false },
+		);
+	}
+}
+
+async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options?: { emitTransitions?: boolean }): Promise<void> {
 	if (!ctx.hasUI) return;
 
 	const stateRoot = getStateRoot(ctx);
 	const refreshed = await refreshAllAgents(stateRoot);
 	const agents = Object.values(refreshed.agents).sort((a, b) => a.id.localeCompare(b.id));
+
+	if (options?.emitTransitions ?? true) {
+		const transitions = collectStatusTransitions(stateRoot, agents);
+		if (transitions.length > 0) {
+			emitStatusTransitions(pi, ctx, transitions);
+		}
+	} else if (!statusSnapshotsByStateRoot.has(stateRoot)) {
+		collectStatusTransitions(stateRoot, agents);
+	}
 
 	if (agents.length === 0) {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -1724,15 +1775,16 @@ async function renderStatusLine(ctx: ExtensionContext): Promise<void> {
 	ctx.ui.setStatus(STATUS_KEY, line);
 }
 
-function ensureStatusPoller(ctx: ExtensionContext): void {
+function ensureStatusPoller(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	statusPollContext = ctx;
+	statusPollApi = pi;
 	if (!ctx.hasUI) return;
 
 	if (!statusPollTimer) {
 		statusPollTimer = setInterval(() => {
-			if (statusPollInFlight || !statusPollContext) return;
+			if (statusPollInFlight || !statusPollContext || !statusPollApi) return;
 			statusPollInFlight = true;
-			void renderStatusLine(statusPollContext)
+			void renderStatusLine(statusPollApi, statusPollContext)
 				.catch(() => {})
 				.finally(() => {
 					statusPollInFlight = false;
@@ -1741,7 +1793,7 @@ function ensureStatusPoller(ctx: ExtensionContext): void {
 		statusPollTimer.unref();
 	}
 
-	void renderStatusLine(ctx).catch(() => {});
+	void renderStatusLine(pi, ctx).catch(() => {});
 }
 
 
@@ -1772,7 +1824,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 					lines.push(`warning: ${warning}`);
 				}
 				renderInfoMessage(pi, ctx, "parallel-agent started", lines);
-				await renderStatusLine(ctx).catch(() => {});
+				await renderStatusLine(pi, ctx).catch(() => {});
 			} catch (err) {
 				ctx.hasUI && ctx.ui.notify(`Failed to start agent: ${stringifyError(err)}`, "error");
 			}
@@ -2000,12 +2052,12 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await ensureChildSessionLinked(pi, ctx).catch(() => {});
-		ensureStatusPoller(ctx);
+		ensureStatusPoller(pi, ctx);
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		await ensureChildSessionLinked(pi, ctx).catch(() => {});
-		ensureStatusPoller(ctx);
+		ensureStatusPoller(pi, ctx);
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
@@ -2018,6 +2070,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		statusPollContext = ctx;
-		await renderStatusLine(ctx).catch(() => {});
+		statusPollApi = pi;
+		await renderStatusLine(pi, ctx, { emitTransitions: false }).catch(() => {});
 	});
 }
