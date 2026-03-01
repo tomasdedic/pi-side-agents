@@ -152,12 +152,59 @@ function isTerminalStatus(status: AgentStatus): boolean {
 	return status === "done" || status === "failed" || status === "crashed";
 }
 
+const STATUS_TRANSITION_PREFIX = "[parallel-agent][status]";
 const TASK_PREVIEW_MAX_CHARS = 220;
 const BACKLOG_LINE_MAX_CHARS = 240;
 const BACKLOG_TOTAL_MAX_CHARS = 2400;
 const ANSI_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const ANSI_OSC_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
 const CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+function resolveBacklogPathForRecord(stateRoot: string, record: AgentRecord): string {
+	if (record.logPath) return record.logPath;
+	if (record.runtimeDir) return join(record.runtimeDir, "backlog.log");
+	return join(getRuntimeDir(stateRoot, record.id), "backlog.log");
+}
+
+async function appendStatusTransitionToBacklog(
+	stateRoot: string,
+	record: AgentRecord,
+	fromStatus: AgentStatus,
+	toStatus: AgentStatus,
+	changedAt: string,
+): Promise<void> {
+	if (fromStatus === toStatus) return;
+
+	const backlogPath = resolveBacklogPathForRecord(stateRoot, record);
+	const line = `${STATUS_TRANSITION_PREFIX} ${changedAt} ${record.id}: ${fromStatus} -> ${toStatus}\n`;
+
+	try {
+		await ensureDir(dirname(backlogPath));
+		await fs.appendFile(backlogPath, line, "utf8");
+		record.logPath = record.logPath ?? backlogPath;
+		record.runtimeDir = record.runtimeDir ?? dirname(backlogPath);
+	} catch {
+		// Best effort only; status updates must not fail if backlog append fails.
+	}
+}
+
+async function setRecordStatus(
+	stateRoot: string,
+	record: AgentRecord,
+	nextStatus: AgentStatus,
+	options?: { logTransition?: boolean },
+): Promise<boolean> {
+	const previousStatus = record.status;
+	if (previousStatus === nextStatus) return false;
+
+	const changedAt = nowIso();
+	record.status = nextStatus;
+	record.updatedAt = changedAt;
+	if (options?.logTransition ?? true) {
+		await appendStatusTransitionToBacklog(stateRoot, record, previousStatus, nextStatus, changedAt);
+	}
+	return true;
+}
 
 function statusShort(status: AgentStatus): string {
 	switch (status) {
@@ -986,14 +1033,16 @@ function tmuxCaptureTail(windowId: string, lines = 10): string[] {
 	return tailLines(captured.stdout, lines);
 }
 
-async function refreshOneAgentRuntime(record: AgentRecord): Promise<void> {
+async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): Promise<void> {
 	if (record.exitFile && (await fileExists(record.exitFile))) {
 		const exit = (await readJsonFile<ExitMarker>(record.exitFile)) ?? {};
 		if (typeof exit.exitCode === "number") {
 			record.exitCode = exit.exitCode;
 			record.finishedAt = exit.finishedAt ?? record.finishedAt ?? nowIso();
-			record.status = exit.exitCode === 0 ? "done" : "failed";
-			record.updatedAt = nowIso();
+			const changed = await setRecordStatus(stateRoot, record, exit.exitCode === 0 ? "done" : "failed");
+			if (!changed) {
+				record.updatedAt = nowIso();
+			}
 			await cleanupWorktreeLockBestEffort(record.worktreePath);
 			return;
 		}
@@ -1006,16 +1055,14 @@ async function refreshOneAgentRuntime(record: AgentRecord): Promise<void> {
 	const live = tmuxWindowExists(record.tmuxWindowId);
 	if (live) {
 		if (record.status === "allocating_worktree" || record.status === "spawning_tmux" || record.status === "starting") {
-			record.status = "running";
-			record.updatedAt = nowIso();
+			await setRecordStatus(stateRoot, record, "running");
 		}
 		return;
 	}
 
 	if (!isTerminalStatus(record.status)) {
-		record.status = "crashed";
 		record.finishedAt = record.finishedAt ?? nowIso();
-		record.updatedAt = nowIso();
+		await setRecordStatus(stateRoot, record, "crashed");
 		if (!record.error) {
 			record.error = "tmux window disappeared before an exit marker was recorded";
 		}
@@ -1028,7 +1075,7 @@ async function refreshAgent(stateRoot: string, agentId: string): Promise<AgentRe
 	await mutateRegistry(stateRoot, async (registry) => {
 		const record = registry.agents[agentId];
 		if (!record) return;
-		await refreshOneAgentRuntime(record);
+		await refreshOneAgentRuntime(stateRoot, record);
 		snapshot = JSON.parse(JSON.stringify(record)) as AgentRecord;
 	});
 	return snapshot;
@@ -1038,7 +1085,7 @@ async function refreshAllAgents(stateRoot: string): Promise<RegistryFile> {
 	return mutateRegistry(stateRoot, async (registry) => {
 		for (const record of Object.values(registry.agents)) {
 			if (record.status === "done") continue;
-			await refreshOneAgentRuntime(record);
+			await refreshOneAgentRuntime(stateRoot, record);
 		}
 	});
 }
@@ -1213,28 +1260,31 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		allocatedBranch = worktree.branch;
 		aggregatedWarnings = [...worktree.warnings];
 
-		await mutateRegistry(stateRoot, async (registry) => {
-			const record = registry.agents[agentId];
-			if (!record) return;
-			record.worktreePath = worktree.worktreePath;
-			record.branch = worktree.branch;
-			record.status = "spawning_tmux";
-			record.updatedAt = nowIso();
-			record.warnings = [...(record.warnings ?? []), ...worktree.warnings];
-		});
-
-		const kickoff = await buildKickoffPrompt(ctx, params.task, params.includeSummary);
-		if (kickoff.warning) aggregatedWarnings.push(kickoff.warning);
-
 		const runtimeDir = getRuntimeDir(stateRoot, agentId);
 		await ensureDir(runtimeDir);
 		const promptPath = join(runtimeDir, "kickoff.md");
 		const logPath = join(runtimeDir, "backlog.log");
 		const exitFile = join(runtimeDir, "exit.json");
 		const launchScriptPath = join(runtimeDir, "launch.sh");
+		await atomicWrite(logPath, "");
+
+		await mutateRegistry(stateRoot, async (registry) => {
+			const record = registry.agents[agentId];
+			if (!record) return;
+			record.worktreePath = worktree.worktreePath;
+			record.branch = worktree.branch;
+			record.runtimeDir = runtimeDir;
+			record.promptPath = promptPath;
+			record.logPath = logPath;
+			record.exitFile = exitFile;
+			await setRecordStatus(stateRoot, record, "spawning_tmux");
+			record.warnings = [...(record.warnings ?? []), ...worktree.warnings];
+		});
+
+		const kickoff = await buildKickoffPrompt(ctx, params.task, params.includeSummary);
+		if (kickoff.warning) aggregatedWarnings.push(kickoff.warning);
 
 		await atomicWrite(promptPath, kickoff.prompt + "\n");
-		await atomicWrite(logPath, "");
 
 		const resolvedModel = await resolveModelSpecForChild(ctx, params.model);
 		const modelSpec = resolvedModel.modelSpec;
@@ -1283,8 +1333,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			record.logPath = logPath;
 			record.exitFile = exitFile;
 			record.model = modelSpec;
-			record.status = "running";
-			record.updatedAt = nowIso();
+			await setRecordStatus(stateRoot, record, "running");
 			record.warnings = [...(record.warnings ?? []), ...aggregatedWarnings];
 		});
 
@@ -1305,10 +1354,12 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			await mutateRegistry(stateRoot, async (registry) => {
 				const record = registry.agents[agentId];
 				if (!record) return;
-				record.status = "failed";
 				record.error = stringifyError(err);
 				record.finishedAt = nowIso();
-				record.updatedAt = nowIso();
+				const changed = await setRecordStatus(stateRoot, record, "failed");
+				if (!changed) {
+					record.updatedAt = nowIso();
+				}
 				if (allocatedWorktreePath) record.worktreePath = allocatedWorktreePath;
 				if (allocatedBranch) record.branch = allocatedBranch;
 				record.warnings = [...(record.warnings ?? []), ...aggregatedWarnings];
@@ -1393,8 +1444,10 @@ async function sendToAgent(stateRoot: string, agentId: string, prompt: string): 
 		const current = registry.agents[normalizedId];
 		if (!current) return;
 		if (!isTerminalStatus(current.status)) {
-			current.status = "running";
-			current.updatedAt = nowIso();
+			const changed = await setRecordStatus(stateRoot, current, "running");
+			if (!changed) {
+				current.updatedAt = nowIso();
+			}
 		}
 	});
 
@@ -1417,8 +1470,10 @@ async function setChildRuntimeStatus(ctx: ExtensionContext, nextStatus: AgentSta
 			return;
 		}
 
-		record.status = nextStatus;
-		record.updatedAt = nowIso();
+		const changed = await setRecordStatus(stateRoot, record, nextStatus, { logTransition: false });
+		if (!changed) {
+			record.updatedAt = nowIso();
+		}
 	});
 }
 
@@ -1504,10 +1559,13 @@ async function ensureChildSessionLinked(pi: ExtensionAPI, ctx: ExtensionContext)
 
 		existing.childSessionId = childSession;
 		existing.parentSessionId = existing.parentSessionId ?? parentSession;
+		let statusChanged = false;
 		if (!isTerminalStatus(existing.status)) {
-			existing.status = "running";
+			statusChanged = await setRecordStatus(stateRoot, existing, "running", { logTransition: false });
 		}
-		existing.updatedAt = nowIso();
+		if (!statusChanged) {
+			existing.updatedAt = nowIso();
+		}
 	});
 
 	const lockPath = join(ctx.cwd, ".pi", "active.lock");

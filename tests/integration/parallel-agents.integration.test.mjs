@@ -653,6 +653,8 @@ test(
 		for (const fileName of ["kickoff.md", "backlog.log", "launch.sh"]) {
 			assert.ok(await exists(join(runtimeDir, fileName)), `runtime file missing: ${fileName}`);
 		}
+		await waitForBacklogContains(harness, "a-0001", "allocating_worktree -> spawning_tmux", 60_000);
+		await waitForBacklogContains(harness, "a-0001", "spawning_tmux -> running", 60_000);
 
 		const linked = await waitFor(
 			"child session link in registry",
@@ -701,6 +703,7 @@ test(
 		assert.equal(done.status, "done");
 		assert.equal(done.exitCode, 0);
 		assert.ok(await exists(join(runtimeDir, "exit.json")), "exit.json should be created when child exits");
+		await waitForBacklogContains(harness, "a-0001", "-> done", 60_000);
 
 		const doneCheck = await callAgentCheckTool(harness, "a-0001", 60_000);
 		assert.equal(doneCheck.payload.ok, true, `agent-check after quit should succeed: ${JSON.stringify(doneCheck.payload)}`);
