@@ -185,12 +185,28 @@ async function waitForAgent(harness, id, options = {}) {
 		async () => {
 			const registry = await readRegistry(harness);
 			const agent = registry.agents?.[id];
-			if (!agent) return false;
+			if (!agent) {
+				if (options.terminal) {
+					return { id, status: "cleaned_up" };
+				}
+				return false;
+			}
 			if (options.status && agent.status !== options.status) return false;
-			if (options.terminal && !["done", "failed", "crashed"].includes(agent.status)) return false;
+			if (options.terminal && !["failed", "crashed"].includes(agent.status)) return false;
 			return agent;
 		},
 		{ timeoutMs: options.timeoutMs ?? 90_000, intervalMs: 300 },
+	);
+}
+
+async function waitForAgentRemoved(harness, id, timeoutMs = 90_000) {
+	return waitFor(
+		`${id} removed from registry`,
+		async () => {
+			const registry = await readRegistry(harness);
+			return registry.agents?.[id] ? false : true;
+		},
+		{ timeoutMs, intervalMs: 300 },
 	);
 }
 
@@ -656,6 +672,12 @@ test(
 		await waitForBacklogContains(harness, "a-0001", "allocating_worktree -> spawning_tmux", 60_000);
 		await waitForBacklogContains(harness, "a-0001", "spawning_tmux -> running", 60_000);
 
+		const launchScript = await readFile(join(runtimeDir, "launch.sh"), "utf8");
+		assert.ok(
+			launchScript.includes("--skill") && launchScript.includes(".pi/parallel-agent-skills"),
+			"child launch script should load .pi/parallel-agent-skills via --skill so finish is discoverable",
+		);
+
 		const linked = await waitFor(
 			"child session link in registry",
 			async () => {
@@ -682,6 +704,11 @@ test(
 
 		await sendParentCommand(harness, "/agents");
 		await waitForParentContains(harness, "a-0001", 30_000);
+		await waitForParentContains(
+			harness,
+			`branch:${started.branch}  worktree:${basename(started.worktreePath)}`,
+			30_000,
+		);
 
 		const runningCheck = await callAgentCheckTool(harness, "a-0001", 60_000);
 		assert.equal(runningCheck.payload.ok, true, `agent-check should succeed: ${JSON.stringify(runningCheck.payload)}`);
@@ -699,15 +726,18 @@ test(
 		assert.equal(quitSend.payload.ok, true, `agent-send /quit should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await waitForBacklogContains(harness, "a-0001", "/quit", 90_000);
 
-		const done = await waitForAgent(harness, "a-0001", { terminal: true, timeoutMs: 120_000 });
-		assert.equal(done.status, "done");
-		assert.equal(done.exitCode, 0);
+		await waitForAgentRemoved(harness, "a-0001", 120_000);
 		assert.ok(await exists(join(runtimeDir, "exit.json")), "exit.json should be created when child exits");
+		const exitPayload = JSON.parse(await readFile(join(runtimeDir, "exit.json"), "utf8"));
+		assert.equal(exitPayload.exitCode, 0, `expected exitCode 0 in exit marker: ${JSON.stringify(exitPayload)}`);
 		await waitForBacklogContains(harness, "a-0001", "-> done", 60_000);
 
 		const doneCheck = await callAgentCheckTool(harness, "a-0001", 60_000);
-		assert.equal(doneCheck.payload.ok, true, `agent-check after quit should succeed: ${JSON.stringify(doneCheck.payload)}`);
-		assert.equal(doneCheck.payload.agent?.status, "done", `expected done status: ${JSON.stringify(doneCheck.payload)}`);
+		assert.equal(doneCheck.payload.ok, false, `agent-check after successful quit should be unknown: ${JSON.stringify(doneCheck.payload)}`);
+		assert.ok(
+			typeof doneCheck.payload.error === "string" && doneCheck.payload.error.includes("Unknown agent id"),
+			`expected unknown-agent error after cleanup: ${JSON.stringify(doneCheck.payload)}`,
+		);
 		await waitForParentContains(harness, "Press any key to close this tmux window", 30_000);
 
 		await closeChildWindowAfterPrompt(harness, "a-0001");
@@ -922,7 +952,8 @@ while true; do
   (
     cd "$PARENT_ROOT" || exit 1
     git checkout "$MAIN_BRANCH" >/dev/null 2>&1 || exit 1
-    git merge --no-ff --no-edit "$BRANCH"
+    sleep 2
+    git merge --no-edit "$BRANCH"
   )
   merge_status=$?
   set -e
@@ -948,9 +979,6 @@ done
 	);
 	await chmod(finishScriptPath, 0o755);
 
-	const preMergeHook = join(repoRoot, ".git", "hooks", "pre-merge-commit");
-	await writeFile(preMergeHook, "#!/usr/bin/env bash\nsleep 2\n");
-	await chmod(preMergeHook, 0o755);
 
 	run("git", ["worktree", "add", "-B", "parallel-agent/a-0001", wt1, "main"], { cwd: repoRoot });
 	run("git", ["worktree", "add", "-B", "parallel-agent/a-0002", wt2, "main"], { cwd: repoRoot });
@@ -1018,10 +1046,10 @@ done
 //     backlog, exercising the 300 ms sleep fix that prevents the follow-up
 //     text from racing with the interrupt.
 //
-//  5. agent-wait-any completion payload shape — when an agent finishes, the
-//     tool must return the same shape as agent-check success: { ok:true,
-//     agent:{...}, backlog:[] }.  Tested in the same harness as (2) to avoid
-//     extra Pi startup overhead.
+//  5. agent-wait-any behavior after successful cleanup — when an agent exits
+//     with code 0 and is auto-pruned from registry, waiting on that id should
+//     return { ok:false, error } rather than hanging. Tested in the same
+//     harness as (2) to avoid extra Pi startup overhead.
 // =============================================================================
 
 // ---------------------------------------------------------------------------
@@ -1086,7 +1114,7 @@ test(
 
 // ---------------------------------------------------------------------------
 // Test 2 — agent-start tool execute returns { ok: true } with all required
-// fields AND agent-wait-any returns a correct completed-agent payload.
+// fields AND agent-wait-any handles a success-pruned id without hanging.
 //
 // WHY THIS IS A GENUINE END-TO-END INTEGRATION TEST:
 //
@@ -1116,7 +1144,7 @@ test(
 // an ok field.  The LLM tool contract requires { ok: true, ... } on success.
 // ---------------------------------------------------------------------------
 test(
-	"integration: tool-call — agent-start execute returns { ok: true } with all required fields; agent-wait-any returns completed-agent payload",
+	"integration: tool-call — agent-start execute returns { ok: true } with all required fields; agent-wait-any returns error for success-pruned id",
 	{ timeout: TEST_TIMEOUT },
 	async (t) => {
 		if (!assertAuthOrSkip(t)) return;
@@ -1178,42 +1206,40 @@ test(
 		assert.strictEqual(rec.worktreePath, sp.worktreePath, "registry worktreePath must match tool result");
 		assert.strictEqual(rec.tmuxWindowId, spawned.tmuxWindowId, "spawned tmuxWindowId must match tool result");
 
-		// — agent-wait-any completion payload shape ——————————————————————————
-		// Terminate the agent, then ask the LLM to call agent-wait-any.  Because
-		// the agent is already in a terminal state, waitForAny returns on the first
-		// poll without sleeping.  The returned payload must match the agent-check
-		// success shape: { ok: true, agent: {...}, backlog: [...] }.
+		// — agent-wait-any behavior after successful auto-prune ————————————
+		// Terminate the agent, wait for registry cleanup, then ask the LLM to call
+		// agent-wait-any. Because success records are removed, this should return
+		// { ok: false, error } quickly instead of hanging.
 		await waitForChildPiBooted(harness, "a-0001", 120_000);
 		const quitSend = await callAgentSendTool(harness, "a-0001", "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
-		await waitForAgent(harness, "a-0001", { terminal: true, timeoutMs: 120_000 });
+		await waitForAgentRemoved(harness, "a-0001", 120_000);
 
 		await sendParentCommand(
 			harness,
-			`Agent a-0001 has finished its task. Please check its final status by calling the agent-wait-any tool with ids: ["a-0001"]. Call the tool now.`,
+			`Agent a-0001 finished and may already be cleaned up. Call the agent-wait-any tool with ids: ["a-0001"] and report the exact tool response.`,
 		);
 
-		// Poll the session for the successful agent-wait-any result.
 		const waitAnyResult = await waitFor(
-			"agent-wait-any success result in parent session",
+			"agent-wait-any error result in parent session",
 			async () => {
 				const entries = await readParentSessionEntries(harness);
 				const results = extractToolResultPayloads(entries, "agent-wait-any");
-				const success = results.find((r) => r.payload.ok === true);
-				return success || false;
+				const failure = results.find((r) => r.payload.ok === false);
+				return failure || false;
 			},
 			{ timeoutMs: 90_000, intervalMs: 500 },
 		);
 
 		const wp = waitAnyResult.payload;
-		assert.strictEqual(wp.ok, true, `agent-wait-any must return ok:true for a completed agent, got: ${JSON.stringify(wp)}`);
-		assert.ok(wp.agent, "completion payload must have an agent sub-object");
-		assert.strictEqual(wp.agent.id, "a-0001", `agent.id must be a-0001, got: ${wp.agent.id}`);
+		assert.strictEqual(wp.ok, false, `agent-wait-any should fail once id is pruned, got: ${JSON.stringify(wp)}`);
+		assert.ok(typeof wp.error === "string", `error must be a string, got: ${typeof wp.error}`);
 		assert.ok(
-			["done", "failed", "crashed"].includes(wp.agent.status),
-			`agent.status must be terminal, got: ${wp.agent.status}`,
+			wp.error.toLowerCase().includes("unknown") ||
+				wp.error.toLowerCase().includes("disappear") ||
+				wp.error.includes("a-0001"),
+			`error should explain missing/pruned id, got: ${wp.error}`,
 		);
-		assert.ok(Array.isArray(wp.backlog), `backlog must be an array, got: ${JSON.stringify(wp.backlog)}`);
 
 		await closeChildWindowAfterPrompt(harness, "a-0001");
 	},
