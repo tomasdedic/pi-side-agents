@@ -16,6 +16,7 @@ const STATUS_KEY = "parallel-agents";
 const REGISTRY_VERSION = 1;
 const CHILD_LINK_ENTRY_TYPE = "parallel-agent-link";
 const STATUS_UPDATE_MESSAGE_TYPE = "parallel-agent-status";
+const PROMPT_UPDATE_MESSAGE_TYPE = "parallel-agent-prompt";
 
 const SUMMARY_SYSTEM_PROMPT = `You are writing a handoff summary for a background coding agent.
 
@@ -106,6 +107,7 @@ type StartAgentResult = {
 	worktreePath: string;
 	branch: string;
 	warnings: string[];
+	prompt: string;
 };
 
 type ExitMarker = {
@@ -168,12 +170,45 @@ function isTerminalStatus(status: AgentStatus): boolean {
 	return status === "done" || status === "failed" || status === "crashed";
 }
 
+const PROMPT_LOG_PREFIX = "[parallel-agent][prompt]";
 const TASK_PREVIEW_MAX_CHARS = 220;
 const BACKLOG_LINE_MAX_CHARS = 240;
 const BACKLOG_TOTAL_MAX_CHARS = 2400;
 const ANSI_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const ANSI_OSC_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
 const CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+function resolveBacklogPathForRecord(stateRoot: string, record: AgentRecord): string {
+	if (record.logPath) return record.logPath;
+	if (record.runtimeDir) return join(record.runtimeDir, "backlog.log");
+	return join(getRuntimeDir(stateRoot, record.id), "backlog.log");
+}
+
+async function appendKickoffPromptToBacklog(
+	stateRoot: string,
+	record: AgentRecord,
+	prompt: string,
+	loggedAt = nowIso(),
+): Promise<void> {
+	const backlogPath = resolveBacklogPathForRecord(stateRoot, record);
+	const promptLines = prompt.replace(/\r\n?/g, "\n").split("\n");
+	const body = promptLines
+		.map((line) => `${PROMPT_LOG_PREFIX} ${loggedAt} ${record.id}: ${line}`)
+		.join("\n");
+	const payload =
+		`${PROMPT_LOG_PREFIX} ${loggedAt} ${record.id}: kickoff prompt begin\n` +
+		`${body}\n` +
+		`${PROMPT_LOG_PREFIX} ${loggedAt} ${record.id}: kickoff prompt end\n`;
+
+	try {
+		await ensureDir(dirname(backlogPath));
+		await fs.appendFile(backlogPath, payload, "utf8");
+		record.logPath = record.logPath ?? backlogPath;
+		record.runtimeDir = record.runtimeDir ?? dirname(backlogPath);
+	} catch {
+		// Best effort only; prompt logging must not block agent startup.
+	}
+}
 
 async function setRecordStatus(_stateRoot: string, record: AgentRecord, nextStatus: AgentStatus): Promise<boolean> {
 	const previousStatus = record.status;
@@ -1387,6 +1422,29 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		if (kickoff.warning) aggregatedWarnings.push(kickoff.warning);
 
 		await atomicWrite(promptPath, kickoff.prompt + "\n");
+		try {
+			await mutateRegistry(stateRoot, async (registry) => {
+				const record = registry.agents[agentId];
+				if (!record) return;
+				await appendKickoffPromptToBacklog(stateRoot, record, kickoff.prompt);
+			});
+		} catch {
+			// Best effort fallback when registry lock/update fails; write directly
+			// to the known backlog path without requiring registry mutation.
+			await appendKickoffPromptToBacklog(
+				stateRoot,
+				{
+					id: agentId,
+					task: params.task,
+					status: "spawning_tmux",
+					startedAt: now,
+					updatedAt: nowIso(),
+					runtimeDir,
+					logPath,
+				},
+				kickoff.prompt,
+			);
+		}
 
 		const resolvedModel = await resolveModelSpecForChild(ctx, params.model);
 		const modelSpec = resolvedModel.modelSpec;
@@ -1439,14 +1497,18 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			record.warnings = [...(record.warnings ?? []), ...aggregatedWarnings];
 		});
 
-		return {
+		const started: StartAgentResult = {
 			id: agentId,
 			tmuxWindowId: windowId,
 			tmuxWindowIndex: windowIndex,
 			worktreePath: worktree.worktreePath,
 			branch: worktree.branch,
 			warnings: aggregatedWarnings,
+			prompt: kickoff.prompt,
 		};
+		emitKickoffPromptMessage(pi, started);
+
+		return started;
 	} catch (err) {
 		if (spawnedWindowId) {
 			run("tmux", ["kill-window", "-t", spawnedWindowId]);
@@ -1783,6 +1845,28 @@ function emitStatusTransitions(pi: ExtensionAPI, ctx: ExtensionContext, transiti
 	}
 }
 
+function emitKickoffPromptMessage(pi: ExtensionAPI, started: StartAgentResult): void {
+	const win = started.tmuxWindowIndex !== undefined ? ` (tmux #${started.tmuxWindowIndex})` : "";
+	const content = `parallel-agent ${started.id}: kickoff prompt${win}\n\n${started.prompt}`;
+	pi.sendMessage(
+		{
+			customType: PROMPT_UPDATE_MESSAGE_TYPE,
+			content,
+			display: false,
+			details: {
+				agentId: started.id,
+				tmuxWindowId: started.tmuxWindowId,
+				tmuxWindowIndex: started.tmuxWindowIndex,
+				worktreePath: started.worktreePath,
+				branch: started.branch,
+				prompt: started.prompt,
+				emittedAt: Date.now(),
+			},
+		},
+		{ triggerTurn: false },
+	);
+}
+
 async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options?: { emitTransitions?: boolean }): Promise<void> {
 	if (!ctx.hasUI) return;
 
@@ -1868,6 +1952,10 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 				];
 				for (const warning of started.warnings) {
 					lines.push(`warning: ${warning}`);
+				}
+				lines.push("", "prompt:");
+				for (const line of started.prompt.split(/\r?\n/)) {
+					lines.push(`  ${line}`);
 				}
 				renderInfoMessage(pi, ctx, "parallel-agent started", lines);
 				await renderStatusLine(pi, ctx).catch(() => {});

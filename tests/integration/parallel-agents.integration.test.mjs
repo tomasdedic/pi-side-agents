@@ -660,6 +660,8 @@ test(
 
 		await sendParentCommand(harness, `/agent -model ${MODEL_SPEC} integration scenario one`);
 		const started = await waitForSpawnedAgent(harness, "a-0001");
+		await waitForParentContains(harness, "parallel-agent started", 45_000);
+		await waitForParentContains(harness, "prompt:", 45_000);
 
 		assert.equal(started.branch, "parallel-agent/a-0001");
 		assert.ok(started.worktreePath, "worktreePath should be recorded");
@@ -669,6 +671,8 @@ test(
 		for (const fileName of ["kickoff.md", "backlog.log", "launch.sh"]) {
 			assert.ok(await exists(join(runtimeDir, fileName)), `runtime file missing: ${fileName}`);
 		}
+		await waitForBacklogContains(harness, "a-0001", "[parallel-agent][prompt]", 60_000);
+		await waitForBacklogContains(harness, "a-0001", "integration scenario one", 60_000);
 
 		const launchScript = await readFile(join(runtimeDir, "launch.sh"), "utf8");
 		assert.ok(
