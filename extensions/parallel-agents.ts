@@ -133,6 +133,7 @@ let statusPollContext: ExtensionContext | undefined;
 let statusPollApi: ExtensionAPI | undefined;
 let statusPollInFlight = false;
 const statusSnapshotsByStateRoot = new Map<string, Map<string, AgentStatus>>();
+let lastRenderedStatusLine: string | undefined;
 
 function nowIso() {
 	return new Date().toISOString();
@@ -202,6 +203,30 @@ function statusShort(status: AgentStatus): string {
 			return "fail";
 		case "crashed":
 			return "crash";
+	}
+}
+
+function statusColorRole(status: AgentStatus): "warning" | "muted" | "accent" | "error" {
+	switch (status) {
+		// Rare/transient states: highlight so they stand out.
+		case "allocating_worktree":
+		case "spawning_tmux":
+		case "starting":
+		case "waiting_merge_lock":
+		case "retrying_reconcile":
+			return "warning";
+		// Normal working states: keep low visual weight.
+		case "running":
+		case "finishing":
+		case "done":
+			return "muted";
+		// Needs user attention.
+		case "waiting_user":
+			return "accent";
+		// Terminal failure.
+		case "failed":
+		case "crashed":
+			return "error";
 	}
 }
 
@@ -1761,18 +1786,25 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 	}
 
 	if (agents.length === 0) {
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+		if (lastRenderedStatusLine !== undefined) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			lastRenderedStatusLine = undefined;
+		}
 		return;
 	}
 
+	const theme = ctx.ui.theme;
 	const line = agents
 		.map((record) => {
 			const win = record.tmuxWindowIndex !== undefined ? `@${record.tmuxWindowIndex}` : "";
-			return `${record.id}:${statusShort(record.status)}${win}`;
+			const entry = `${record.id}:${statusShort(record.status)}${win}`;
+			return theme.fg(statusColorRole(record.status), entry);
 		})
 		.join(" ");
 
+	if (line === lastRenderedStatusLine) return;
 	ctx.ui.setStatus(STATUS_KEY, line);
+	lastRenderedStatusLine = line;
 }
 
 function ensureStatusPoller(pi: ExtensionAPI, ctx: ExtensionContext): void {
