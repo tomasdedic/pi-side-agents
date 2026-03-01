@@ -123,6 +123,7 @@ type CommandResult = {
 let statusPollTimer: NodeJS.Timeout | undefined;
 let statusPollContext: ExtensionContext | undefined;
 let statusPollInFlight = false;
+let lastRenderedStatusLine: string | undefined;
 
 function nowIso() {
 	return new Date().toISOString();
@@ -1734,7 +1735,10 @@ async function renderStatusLine(ctx: ExtensionContext): Promise<void> {
 	const agents = Object.values(refreshed.agents).sort((a, b) => a.id.localeCompare(b.id));
 
 	if (agents.length === 0) {
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+		if (lastRenderedStatusLine !== undefined) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			lastRenderedStatusLine = undefined;
+		}
 		return;
 	}
 
@@ -1747,7 +1751,9 @@ async function renderStatusLine(ctx: ExtensionContext): Promise<void> {
 		})
 		.join(" ");
 
+	if (line === lastRenderedStatusLine) return;
 	ctx.ui.setStatus(STATUS_KEY, line);
+	lastRenderedStatusLine = line;
 }
 
 function ensureStatusPoller(ctx: ExtensionContext): void {
