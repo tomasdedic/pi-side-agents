@@ -1723,7 +1723,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 			if (records.length === 0) {
 				lines.push("(no tracked agents)");
 			} else {
-				for (const record of records) {
+				for (const [index, record] of records.entries()) {
 					const win = record.tmuxWindowIndex !== undefined ? `#${record.tmuxWindowIndex}` : "-";
 					const worktreeName = record.worktreePath ? basename(record.worktreePath) || record.worktreePath : "-";
 					lines.push(
@@ -1733,6 +1733,9 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 					if (record.error) lines.push(`  error: ${record.error}`);
 					if (record.status === "failed" || record.status === "crashed") {
 						failedIds.push(record.id);
+					}
+					if (index < records.length - 1) {
+						lines.push("");
 					}
 				}
 			}
