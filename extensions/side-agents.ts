@@ -2038,6 +2038,7 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 			}
 
 			try {
+				ctx.hasUI && ctx.ui.notify("Starting side-agent…", "info");
 				const started = await startAgent(pi, ctx, {
 					task: parsed.task,
 					model: parsed.model,
