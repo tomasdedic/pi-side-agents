@@ -1249,6 +1249,29 @@ test(
 		// Without this, C-c arrives before Pi is ready and is discarded,
 		// leaving the agent running until waitForAgent(terminal) times out.
 		await waitForChildPiBooted(harness, agentId, 120_000);
+
+		// ── Validate backlog captures visible pane content, not just footer ──
+		// After the child has booted, agent-check backlog should contain
+		// meaningful content from the visible tmux pane (e.g. "pi v" version
+		// string), not just TUI footer/status bar redraws.
+		const bootedCheck = await callAgentCheckTool(harness, agentId, 60_000);
+		assert.equal(bootedCheck.payload.ok, true, "agent-check after boot should succeed");
+		assert.ok(Array.isArray(bootedCheck.payload.backlog), "backlog should be an array");
+		if (bootedCheck.payload.backlog.length > 0) {
+			const backlogText = bootedCheck.payload.backlog.join("\n");
+			// The backlog should NOT be entirely separator/footer lines.
+			// At minimum, after boot we expect some content beyond just
+			// ── separators and status bar lines.
+			const separatorRe = /^[-─—_=]{5,}$/u;
+			const nonSeparatorLines = bootedCheck.payload.backlog.filter(
+				(line) => !separatorRe.test(line.trim()),
+			);
+			assert.ok(
+				nonSeparatorLines.length > 0,
+				`backlog should contain non-separator content after boot, got: ${backlogText}`,
+			);
+		}
+
 		const quitSend = await callAgentSendTool(harness, agentId, "!/quit", 60_000);
 		assert.equal(quitSend.payload.ok, true, `agent-send should succeed: ${JSON.stringify(quitSend.payload)}`);
 		await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 });

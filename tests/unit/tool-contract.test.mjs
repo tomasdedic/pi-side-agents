@@ -350,6 +350,97 @@ test("sanitizeBacklogLines — strips ANSI/control sequences and truncates lines
 	}
 });
 
+test("collectRecentBacklogLines — extracts content from visible pane with footer at bottom", () => {
+	// A real tmux visible pane has ~50 lines of content with a 3-4 line TUI
+	// footer at the very bottom.  When requesting 10 lines, we should get
+	// actual content mixed with just a few footer lines — much better than
+	// the old backlog.log approach which was 100% footer redraws.
+	const visiblePaneLines = [
+		// ... many earlier content lines ...
+		" $ npm test -- tests/e2e/auth.test.ts",
+		"",
+		" PASS  tests/e2e/auth.test.ts",
+		"  Auth module",
+		"    ✓ login flow (230 ms)",
+		"    ✓ logout clears session (45 ms)",
+		"",
+		" All 474 tests pass (473 + 1 new). Let me amend the commit:",
+		"",
+		" $ git add -u && git commit --amend --no-edit",
+		"",
+		" check for added large files..................................................Passed",
+		" [side-agent/fix-auth 450d750] feat: fix auth leak in login page",
+		"  3 files changed, 42 insertions(+), 7 deletions(-)",
+		"",
+		// Footer (only the last few lines)
+		"── smart ──────────────────────────────────────────────────────────────",
+		"~/projects/repo-worktree-0001 (side-agent/fix-auth)",
+		"↑25 ↓5.6k R375k W28k $0.500 (sub) 13.9%/200k (auto)                 (anthropic) claude-opus-…",
+		"YOLO mode fix-auth:run@10 │ Claude │ Ctx ━━━━━━ 14% used │ 5h 3h44m left",
+	];
+
+	const result = collectRecentBacklogLines(visiblePaneLines, 10);
+	assert.ok(result.length > 0, `expected non-empty result, got ${result.length} lines`);
+
+	// With 10 requested lines, we should get actual content (commit messages,
+	// test output) mixed in — not purely footer/status lines.
+	const joined = result.join("\n");
+	assert.ok(
+		joined.includes("tests pass") || joined.includes("fix-auth 450d750") || joined.includes("git commit") || joined.includes("PASS"),
+		`expected meaningful content in backlog, got:\n${joined}`,
+	);
+
+	// Separator lines should be filtered out
+	for (const line of result) {
+		const cleaned = stripTerminalNoise(line).trim();
+		assert.ok(!BACKLOG_SEPARATOR_RE.test(cleaned), `separator line should be filtered: ${line}`);
+	}
+});
+
+test("collectRecentBacklogLines — visible pane is bounded unlike backlog.log", () => {
+	// The key improvement of using tmux capture-pane (visible) over backlog.log:
+	// backlog.log accumulates footer redraws unboundedly — thousands of lines of
+	// pure footer noise.  The visible pane is bounded to one screen (~50 lines)
+	// so even in the worst case, footer lines are limited and real content from
+	// above is included.
+	//
+	// Simulate a backlog.log-style accumulation: 200 footer redraws, then one
+	// real content line far back.  selectBacklogTailLines (used for file reading)
+	// would miss the content entirely.
+	const backlogFileLines = [];
+	backlogFileLines.push("Real content: all tests passed");
+	for (let i = 0; i < 200; i++) {
+		backlogFileLines.push("── smart ──────────────────────────────────────────────────────────────");
+		backlogFileLines.push("~/projects/repo (side-agent/foo)");
+		backlogFileLines.push(`↑10 ↓2k R100k W5k $0.${String(i).padStart(3, "0")}`);
+		backlogFileLines.push("YOLO mode foo:run@3 │ Claude │ Ctx ━━━━━━ 5% used");
+	}
+
+	// With backlog.log approach (tail 10 from 800+ lines) — content is buried
+	const fromFile = selectBacklogTailLines(backlogFileLines.join("\n"), 10);
+	const fileJoined = fromFile.join("\n");
+	assert.ok(
+		!fileJoined.includes("all tests passed"),
+		"backlog.log tail should miss content buried under footer redraws",
+	);
+
+	// With visible pane approach — content is nearby (screen is bounded)
+	// Simulate a visible pane: content + just one footer at the bottom
+	const visibleLines = [
+		"Real content: all tests passed",
+		"── smart ──────────────────────────────────────────────────────────────",
+		"~/projects/repo (side-agent/foo)",
+		"↑10 ↓2k R100k W5k $0.100",
+		"YOLO mode foo:run@3 │ Claude │ Ctx ━━━━━━ 5% used",
+	];
+	const fromVisible = collectRecentBacklogLines(visibleLines, 10);
+	const visibleJoined = fromVisible.join("\n");
+	assert.ok(
+		visibleJoined.includes("all tests passed"),
+		`visible pane should include real content, got:\n${visibleJoined}`,
+	);
+});
+
 test("summarizeTask — collapses whitespace and truncates", () => {
 	const task = "Line one\n\n\tline two with details " + "x".repeat(400);
 	const summary = summarizeTask(task, 120);
