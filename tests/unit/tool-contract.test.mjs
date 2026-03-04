@@ -784,7 +784,47 @@ test("agent-send '/' prefix is forwarded verbatim (no special parse)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Branch naming convention
+// 5. Kickoff prompt — parent session suffix
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-implementation of the session-suffix logic from buildKickoffPrompt.
+ * When no summary is generated, the kickoff prompt is task + sessionSuffix.
+ */
+function buildSimpleKickoffPrompt(task, parentSession) {
+	const sessionSuffix = parentSession ? `\n\nParent Pi session: ${parentSession}` : "";
+	return task + sessionSuffix;
+}
+
+test("kickoff prompt — appends parent session path when available", () => {
+	const result = buildSimpleKickoffPrompt("Fix the bug", "/home/user/.pi/agent/sessions/abc123/session.jsonl");
+	assert.ok(result.startsWith("Fix the bug"), "task must come first");
+	assert.ok(result.includes("Parent Pi session: /home/user/.pi/agent/sessions/abc123/session.jsonl"),
+		"must include parent session path");
+});
+
+test("kickoff prompt — no suffix when parent session is undefined", () => {
+	const result = buildSimpleKickoffPrompt("Fix the bug", undefined);
+	assert.strictEqual(result, "Fix the bug", "should be raw task without suffix");
+});
+
+test("kickoff prompt — no suffix when parent session is empty string", () => {
+	const result = buildSimpleKickoffPrompt("Fix the bug", "");
+	assert.strictEqual(result, "Fix the bug", "empty session should produce no suffix");
+});
+
+test("kickoff prompt — suffix is separated by blank line from task", () => {
+	const result = buildSimpleKickoffPrompt("Do something", "/tmp/session.jsonl");
+	const lines = result.split("\n");
+	// task, blank, blank (from \n\n), then "Parent Pi session: ..."
+	assert.ok(lines.length >= 3, `expected at least 3 lines, got ${lines.length}`);
+	assert.strictEqual(lines[0], "Do something");
+	assert.strictEqual(lines[1], "", "first separator line should be empty");
+	assert.ok(lines[2].startsWith("Parent Pi session:"), "third line should be the session ref");
+});
+
+// ---------------------------------------------------------------------------
+// 6. Branch naming convention
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
