@@ -2027,7 +2027,11 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 		collectStatusTransitions(stateRoot, agents);
 	}
 
-	if (agents.length === 0) {
+	// Inside a child agent, hide our own entry — only show siblings.
+	const selfId = process.env[ENV_AGENT_ID];
+	const visible = selfId ? agents.filter((r) => r.id !== selfId) : agents;
+
+	if (visible.length === 0) {
 		if (lastRenderedStatusLine !== undefined) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			lastRenderedStatusLine = undefined;
@@ -2036,7 +2040,7 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 	}
 
 	const theme = ctx.ui.theme;
-	const line = agents
+	const line = visible
 		.map((record) => {
 			const win = record.tmuxWindowIndex !== undefined ? `@${record.tmuxWindowIndex}` : "";
 			const entry = `${record.id}:${statusShort(record.status)}${win}`;
