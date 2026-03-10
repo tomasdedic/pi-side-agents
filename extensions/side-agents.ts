@@ -2852,7 +2852,7 @@ async function renderStatusLine(pi: ExtensionAPI, ctx: ExtensionContext, options
 
 	// Build the status bar string: "agent1:run@2 agent2:wait@5"
 	const theme = ctx.ui.theme;
-	const line = agents
+	const line = visible
 		.map((record) => {
 			const win = record.tmuxWindowIndex !== undefined ? `@${record.tmuxWindowIndex}` : "";
 			const entry = `${record.id}:${statusShort(record.status)}${win}`;
