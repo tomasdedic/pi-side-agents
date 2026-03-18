@@ -790,6 +790,14 @@ function isGitRepo(cwd: string): boolean {
 	return result.ok && result.stdout.trim() === "true";
 }
 
+function getCurrentBranch(cwd: string): string {
+	const result = run("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]);
+	if (!result.ok) return "";
+	const branch = result.stdout.trim();
+	if (!branch || branch === "HEAD") return "";
+	return branch;
+}
+
 // ─── Path helpers for the shared state directory ──────────────────────────────
 
 // Returns the "state root" – the folder that anchors .pi/side-agents/.
@@ -1548,8 +1556,8 @@ async function allocateWorktree(options: {
 	if (chosenRegistered) {
 		// Reuse an existing worktree: hard-reset it to HEAD, clean untracked files,
 		// and switch to the new agent branch.
-		const oldBranchResult = run("git", ["-C", chosenPath, "branch", "--show-current"]);
-		const oldBranch = oldBranchResult.ok ? oldBranchResult.stdout.trim() : "";
+		// Remember old branch so we can try to clean it up after switching away.
+		const oldBranch = getCurrentBranch(chosenPath);
 
 		run("git", ["-C", chosenPath, "merge", "--abort"]); // ignore errors (no merge in progress)
 		runOrThrow("git", ["-C", chosenPath, "reset", "--hard", mainHead]);
@@ -1741,9 +1749,14 @@ export ${ENV_PARENT_REPO}=\"$PARENT_REPO\"
 export ${ENV_STATE_ROOT}=\"$STATE_ROOT\"
 export ${ENV_RUNTIME_DIR}=\"$RUNTIME_DIR\"
 ${kubeconfigExport}
+
+iso_now() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
 write_exit() {
   local code="$1"
-  printf '{"exitCode":%d,"finishedAt":"%s"}\n' "$code" "$(date -Is)" > "$EXIT_FILE"
+  printf '{"exitCode":%d,"finishedAt":"%s"}\n' "$code" "$(iso_now)" > "$EXIT_FILE"
 }
 
 cd "$WORKTREE"
