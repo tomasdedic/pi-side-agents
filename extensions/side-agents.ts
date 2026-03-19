@@ -289,7 +289,7 @@ type StartAgentResult = {
 	tmuxWindowId: string;
 	tmuxWindowIndex: number;
 	worktreePath: string;
-	branch: string;
+	branch?: string;
 	warnings: string[];
 	prompt: string;           // the full kickoff prompt sent to the child
 };
@@ -782,6 +782,12 @@ function resolveGitRoot(cwd: string): string {
 		if (root.length > 0) return resolve(root);
 	}
 	return resolve(cwd);
+}
+
+// Returns true if `cwd` is inside a git repository.
+function isGitRepo(cwd: string): boolean {
+	const result = run("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"]);
+	return result.ok && result.stdout.trim() === "true";
 }
 
 // ─── Path helpers for the shared state directory ──────────────────────────────
@@ -2165,6 +2171,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 
 	const stateRoot = getStateRoot(ctx);
 	const repoRoot = resolveGitRoot(stateRoot);
+	const isGit = isGitRepo(stateRoot);
 	const parentSessionId = ctx.sessionManager.getSessionFile();
 	const now = nowIso();
 
@@ -2199,25 +2206,34 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 				parentSessionId,
 				task: params.task,
 				model: params.model,
-				status: "allocating_worktree",
+				status: isGit ? "allocating_worktree" : "spawning_tmux",
 				startedAt: now,
 				updatedAt: now,
 			};
 		});
 
-		// Step 3: set up the git worktree.
-		const worktree = await allocateWorktree({
-			repoRoot,
-			stateRoot,
-			agentId,
-			parentSessionId,
-		});
-		allocatedWorktreePath = worktree.worktreePath;
-		allocatedBranch = worktree.branch;
-		// Spread `[...worktree.warnings]` creates a *copy* of the warnings array
-		// so that later `.push()` calls on aggregatedWarnings don't accidentally
-		// mutate the original array inside the worktree result object.
-		aggregatedWarnings = [...worktree.warnings];
+		// Step 3: set up the working directory for the agent.
+		let worktreePath: string;
+		let worktreeBranch: string | undefined;
+		let worktreeWarnings: string[] = [];
+
+		if (isGit) {
+			const worktree = await allocateWorktree({
+				repoRoot,
+				stateRoot,
+				agentId,
+				parentSessionId,
+			});
+			worktreePath = worktree.worktreePath;
+			worktreeBranch = worktree.branch;
+			worktreeWarnings = worktree.warnings;
+		} else {
+			worktreePath = resolve(ctx.cwd);
+			worktreeWarnings = ["not a git repo, running agent in current directory"];
+		}
+		allocatedWorktreePath = worktreePath;
+		allocatedBranch = worktreeBranch;
+		aggregatedWarnings = [...worktreeWarnings];
 
 		// Step 4: prepare a clean runtime directory (archiving any old one).
 		const runtimePrep = await prepareFreshRuntimeDir(stateRoot, agentId);
@@ -2240,14 +2256,14 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		await mutateRegistry(stateRoot, async (registry) => {
 			const record = registry.agents[agentId];
 			if (!record) return;
-			record.worktreePath = worktree.worktreePath;
-			record.branch = worktree.branch;
+			record.worktreePath = worktreePath;
+			if (worktreeBranch) record.branch = worktreeBranch;
 			record.runtimeDir = runtimeDir;
 			record.promptPath = promptPath;
 			record.logPath = logPath;
 			record.exitFile = exitFile;
 			await setRecordStatus(stateRoot, record, "spawning_tmux");
-			record.warnings = [...(record.warnings ?? []), ...worktree.warnings];
+			record.warnings = [...(record.warnings ?? []), ...worktreeWarnings];
 		});
 
 		// Step 6: build the kickoff prompt (with optional LLM context summary).
@@ -2293,10 +2309,12 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 
 		// Record the tmux window ID in the worktree lock so orphan scanning can
 		// check whether the window is still alive.
-		await updateWorktreeLock(worktree.worktreePath, {
-			tmuxWindowId: windowId,
-			tmuxWindowIndex: windowIndex,
-		});
+		if (isGit) {
+			await updateWorktreeLock(worktreePath, {
+				tmuxWindowId: windowId,
+				tmuxWindowIndex: windowIndex,
+			});
+		}
 
 		// Step 8: write launch.sh, make it executable, then start it in the pane.
 		const launchScript = buildLaunchScript({
@@ -2304,7 +2322,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			parentSessionId,
 			parentRepoRoot: repoRoot,
 			stateRoot,
-			worktreePath: worktree.worktreePath,
+			worktreePath,
 			tmuxWindowId: windowId,
 			promptPath,
 			exitFile,
@@ -2319,7 +2337,7 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 		tmuxPipePaneToFile(windowId, logPath);
 		// Run cd in the interactive pane shell first so Ctrl+Z in child Pi drops
 		// back to the child worktree prompt (not the parent worktree).
-		tmuxSendLine(windowId, `cd ${shellQuote(worktree.worktreePath)}`);
+		tmuxSendLine(windowId, `cd ${shellQuote(worktreePath)}`);
 		tmuxSendLine(windowId, `bash ${shellQuote(launchScriptPath)}`);
 
 		// Step 9: finalise the registry record with all runtime details.
@@ -2329,8 +2347,8 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			record.tmuxSession = tmuxSession;
 			record.tmuxWindowId = windowId;
 			record.tmuxWindowIndex = windowIndex;
-			record.worktreePath = worktree.worktreePath;
-			record.branch = worktree.branch;
+			record.worktreePath = worktreePath;
+			if (worktreeBranch) record.branch = worktreeBranch;
 			record.runtimeDir = runtimeDir;
 			record.promptPath = promptPath;
 			record.logPath = logPath;
@@ -2348,8 +2366,8 @@ async function startAgent(pi: ExtensionAPI, ctx: ExtensionContext, params: Start
 			id: agentId,
 			tmuxWindowId: windowId,
 			tmuxWindowIndex: windowIndex,
-			worktreePath: worktree.worktreePath,
-			branch: worktree.branch,
+			worktreePath,
+			branch: worktreeBranch,
 			warnings: aggregatedWarnings,
 			prompt: kickoff.prompt,
 		};
@@ -2940,8 +2958,8 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 					`id: ${started.id}`,
 					`tmux window: ${started.tmuxWindowId} (#${started.tmuxWindowIndex})`,
 					`worktree: ${started.worktreePath}`,
-					`branch: ${started.branch}`,
 				];
+				if (started.branch) lines.push(`branch: ${started.branch}`);
 				for (const warning of started.warnings) {
 					lines.push(`warning: ${warning}`);
 				}
@@ -3118,8 +3136,8 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 						`id: ${started.id}`,
 						`tmux window: ${started.tmuxWindowId} (#${started.tmuxWindowIndex})`,
 						`worktree: ${started.worktreePath}`,
-						`branch: ${started.branch}`,
 					];
+					if (started.branch) lines.push(`branch: ${started.branch}`);
 					for (const warning of started.warnings) {
 						lines.push(`warning: ${warning}`);
 					}
