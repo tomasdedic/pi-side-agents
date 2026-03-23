@@ -1210,11 +1210,21 @@ async function updateWorktreeLock(worktreePath: string, patch: Record<string, un
 	await writeWorktreeLock(worktreePath, { ...current, ...patch });
 }
 
-// Deletes the active.lock file when the agent finishes or fails.
-// Ignores errors (the file may already be gone).
-async function cleanupWorktreeLockBestEffort(worktreePath?: string): Promise<void> {
+async function cleanupWorktreeLockBestEffort(worktreePath?: string, agentId?: string): Promise<void> {
 	if (!worktreePath) return;
 	const lockPath = join(worktreePath, ".pi", "active.lock");
+	// If an agentId is provided, verify the lock actually belongs to this agent
+	// before deleting — another agent may have since claimed the same worktree.
+	if (agentId) {
+		try {
+			const lock = await readJsonFile<Record<string, unknown>>(lockPath);
+			if (lock && typeof lock.agentId === "string" && lock.agentId !== agentId) {
+				return;
+			}
+		} catch {
+			// If we can't read the lock, proceed with deletion attempt
+		}
+	}
 	await fs.unlink(lockPath).catch(() => {});
 }
 
@@ -1467,11 +1477,21 @@ async function allocateWorktree(options: {
 	let chosen: WorktreeSlot | undefined;
 	let maxIndex = 0;
 
+	// Build a set of worktree paths claimed by active (non-terminal) agents in the registry,
+	// so we can reject slots even if the lock file was inadvertently cleaned up.
+	const claimedByActiveAgent = new Set<string>();
+	for (const record of Object.values(registry.agents)) {
+		if (record.id !== agentId && record.worktreePath && !isTerminalStatus(record.status)) {
+			claimedByActiveAgent.add(resolve(record.worktreePath));
+		}
+	}
+
 	for (const slot of slots) {
 		maxIndex = Math.max(maxIndex, slot.index);
+		const resolvedSlotPath = resolve(slot.path);
 		const lockPath = join(slot.path, ".pi", "active.lock");
 
-		// Skip locked slots (another agent is using them).
+		// Check 1: lock file on disk.
 		if (await fileExists(lockPath)) {
 			const lock = await readJsonFile<Record<string, unknown>>(lockPath);
 			const lockAgentId = typeof lock?.agentId === "string" ? lock.agentId : undefined;
@@ -1481,7 +1501,12 @@ async function allocateWorktree(options: {
 			continue;
 		}
 
-		// For registered worktrees, verify they have no uncommitted changes.
+		// Check 2: registry claims this worktree for an active agent (even if lock is missing).
+		if (claimedByActiveAgent.has(resolvedSlotPath)) {
+			warnings.push(`Worktree claimed by active agent in registry (missing lock): ${slot.path}`);
+			continue;
+		}
+
 		const isRegistered = registered.has(resolve(slot.path));
 		if (isRegistered) {
 			const status = run("git", ["-C", slot.path, "status", "--porcelain"]);
@@ -1874,7 +1899,7 @@ type RefreshRuntimeResult = {
 //   4. tmux window gone without an exit marker? → "crashed".
 async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): Promise<RefreshRuntimeResult> {
 	if (record.status === "done") {
-		await cleanupWorktreeLockBestEffort(record.worktreePath);
+		await cleanupWorktreeLockBestEffort(record.worktreePath, record.id);
 		return { removeFromRegistry: true };
 	}
 
@@ -1889,14 +1914,10 @@ async function refreshOneAgentRuntime(stateRoot: string, record: AgentRecord): P
 				record.updatedAt = nowIso();
 			}
 			if (exit.exitCode === 0) {
-<<<<<<< HEAD
-				return { removeFromRegistry: true }; // successful agents are pruned
-=======
 				// Only release worktree lock for successful agents; failed agents
 				// keep it so the workspace is not reused until explicitly cleared.
-				await cleanupWorktreeLockBestEffort(record.worktreePath);
-				return { removeFromRegistry: true };
->>>>>>> e981050 (Keep worktree locked for failed/crashed agents until explicitly cleared)
+				await cleanupWorktreeLockBestEffort(record.worktreePath, record.id);
+				return { removeFromRegistry: true }; // successful agents are pruned
 			}
 			return { removeFromRegistry: false }; // failed agents stay for inspection
 		}
