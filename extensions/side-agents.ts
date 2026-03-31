@@ -1120,7 +1120,10 @@ async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug
 			timestamp: Date.now(),
 		};
 
-		const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		if (!auth.ok) {
+			return { slug: slugFromTask(task), warning: `Slug generation auth failed: ${auth.error}. Used heuristic fallback.` };
+		}
 		const response = await complete(
 			ctx.model,
 			{
@@ -1128,7 +1131,7 @@ async function generateSlug(ctx: ExtensionContext, task: string): Promise<{ slug
 					"Generate a 2-3 word kebab-case slug summarizing the given task. Reply with ONLY the slug, nothing else. Examples: fix-auth-leak, add-retry-logic, update-readme",
 				messages: [userMessage],
 			},
-			{ apiKey, maxTokens: 30 }, // 30 tokens is plenty for a short slug
+			{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: 30 }, // 30 tokens is plenty for a short slug
 		);
 
 		// Extract the text content from the response blocks and sanitize it.
@@ -1641,11 +1644,12 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 			timestamp: Date.now(),
 		};
 
-		const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		if (!auth.ok) throw new Error(`Auth failed for summary generation: ${auth.error}`);
 		const response = await complete(
 			ctx.model,
 			{ systemPrompt: SUMMARY_SYSTEM_PROMPT, messages: [userMessage] },
-			{ apiKey },
+			{ apiKey: auth.apiKey, headers: auth.headers },
 		);
 
 		// Collect and normalise the LLM's text output.
