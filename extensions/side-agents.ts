@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 // `fs.promises` for async file I/O; `readFileSync` for the one synchronous
 // settings read at extension load time.
 import { promises as fs, readFileSync } from "node:fs";
+import os from "node:os";
 // Path utilities: basename = filename only, dirname = parent folder,
 // join = combine path segments, resolve = absolute path.
 import { basename, dirname, join, resolve } from "node:path";
@@ -2049,11 +2050,39 @@ function renderInfoMessage(pi: ExtensionAPI, ctx: ExtensionContext, title: strin
 
 // ─── Command argument parsing ─────────────────────────────────────────────────
 
+/** Resolve a pi-amplike mode name to a model spec by reading the global modes.json file. */
+async function resolveModeToModelSpec(modeName: string): Promise<{ modelSpec?: string; warning?: string }> {
+	const homedir = os.homedir();
+	const agentDir = process.env.PI_CODING_AGENT_DIR
+		? resolve(process.env.PI_CODING_AGENT_DIR.replace(/^~/, homedir))
+		: join(homedir, ".pi", "agent");
+	const modesPath = join(agentDir, "modes.json");
+
+	try {
+		const raw = await fs.readFile(modesPath, "utf8");
+		const parsed = JSON.parse(raw) as { modes?: Record<string, { provider?: string; modelId?: string; thinkingLevel?: string }> };
+		if (!parsed.modes || !parsed.modes[modeName]) {
+			return { warning: `Mode '${modeName}' not found in ${modesPath}` };
+		}
+		const spec = parsed.modes[modeName];
+		if (!spec.provider || !spec.modelId) {
+			return { warning: `Mode '${modeName}' has no provider/modelId in ${modesPath}` };
+		}
+		const modelSpec = spec.thinkingLevel
+			? `${spec.provider}/${spec.modelId}:${spec.thinkingLevel}`
+			: `${spec.provider}/${spec.modelId}`;
+		return { modelSpec };
+	} catch {
+		return { warning: `Could not read modes from ${modesPath}` };
+	}
+}
+
 // Parses the raw argument string of /agent or alias commands.
-// Extracts an optional "-model <spec>" flag and returns the remainder as `task`.
-function parseAgentCommandArgs(raw: string): { task: string; model?: string } {
+// Extracts optional "-model <spec>" and "-mode <name>" flags.
+function parseAgentCommandArgs(raw: string): { task: string; model?: string; mode?: string } {
 	let rest = raw;
 	let model: string | undefined;
+	let mode: string | undefined;
 
 	const modelMatch = rest.match(/(?:^|\s)-model\s+(\S+)/);
 	if (modelMatch) {
@@ -2061,9 +2090,16 @@ function parseAgentCommandArgs(raw: string): { task: string; model?: string } {
 		rest = rest.replace(modelMatch[0], " "); // remove the flag from the string
 	}
 
+	const modeMatch = rest.match(/(?:^|\s)-mode\s+(\S+)/);
+	if (modeMatch) {
+		mode = modeMatch[1];
+		rest = rest.replace(modeMatch[0], " ");
+	}
+
 	return {
 		task: rest.trim(),
 		model,
+		mode,
 	};
 }
 
@@ -2978,23 +3014,34 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 	// agents — only the root parent session registers spawn-related tools/commands.
 	const isChild = !!process.env[ENV_AGENT_ID];
 
-	// /agent [-model <spec>] <task>
+	// /agent [-model <spec>] [-mode <name>] <task>
 	// Spawns a new background child agent for the given task.
 	// Not registered in child sessions to enforce a single level of parallelism.
 	if (!isChild) pi.registerCommand("agent", {
-		description: "Spawn a background child agent in its own tmux window/worktree: /agent [-model <provider/id>] <task>",
+		description: "Spawn a background child agent in its own tmux window/worktree: /agent [-model <provider/id>] [-mode <name>] <task>",
 		handler: async (args, ctx) => {
 			const parsed = parseAgentCommandArgs(args);
 			if (!parsed.task) {
-				ctx.hasUI && ctx.ui.notify("Usage: /agent [-model <provider/id>] <task>", "error");
+				ctx.hasUI && ctx.ui.notify("Usage: /agent [-model <provider/id>] [-mode <name>] <task>", "error");
 				return;
+			}
+
+			// Resolve -mode (pi-amplike modes) to a model spec if no explicit -model was given.
+			let resolvedModel = parsed.model;
+			if (parsed.mode && !parsed.model) {
+				const modeResult = await resolveModeToModelSpec(parsed.mode);
+				if (modeResult.modelSpec) {
+					resolvedModel = modeResult.modelSpec;
+				} else if (modeResult.warning) {
+					ctx.hasUI && ctx.ui.notify(modeResult.warning, "warning");
+				}
 			}
 
 			try {
 				ctx.hasUI && ctx.ui.notify("Starting side-agent…", "info");
 				const started = await startAgent(pi, ctx, {
 					task: parsed.task,
-					model: parsed.model,
+					model: resolvedModel,
 					includeSummary: true, // /agent always tries to distil parent context
 				});
 
