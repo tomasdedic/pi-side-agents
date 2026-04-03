@@ -3430,13 +3430,6 @@ export default function sideAgentsExtension(pi: ExtensionAPI) {
 		ensureStatusPoller(pi, ctx);
 	});
 
-	// session_switch: fired when the user switches to a different conversation branch.
-	// Same dual purpose as session_start.
-	pi.on("session_switch", async (_event, ctx) => {
-		await ensureChildSessionLinked(pi, ctx).catch(() => {});
-		ensureStatusPoller(pi, ctx);
-	});
-
 	// agent_start: fired just before the LLM starts generating a response turn.
 	// In the child process: marks the agent as "running" in the registry.
 	pi.on("agent_start", async (_event, ctx) => {
