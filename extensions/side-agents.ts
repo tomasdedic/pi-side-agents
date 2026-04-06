@@ -1989,9 +1989,8 @@ async function refreshAgent(stateRoot: string, agentId: string): Promise<AgentRe
 
 // Refreshes all agents in the registry in one pass and returns the updated registry.
 async function refreshAllAgents(stateRoot: string): Promise<RegistryFile> {
-	// mutateRegistry takes an async callback. We pass one with `async (registry) => { … }`.
-	// The callback receives the loaded registry, mutates it, and mutateRegistry
-	// saves it if anything changed, then returns the final registry object.
+	// Don't create the meta dir just to discover there are no agents.
+	if (!(await fileExists(getMetaDir(stateRoot)))) return emptyRegistry();
 	return mutateRegistry(stateRoot, async (registry) => {
 		// Object.entries(obj) → array of [key, value] pairs.
 		// for (const [agentId, record] of …) — array destructuring in a for…of:
