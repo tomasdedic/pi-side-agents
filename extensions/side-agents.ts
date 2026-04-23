@@ -7,7 +7,7 @@ import { convertToLlm, serializeConversation } from "@mariozechner/pi-coding-age
 // Type-only imports: the public surface the extension receives from Pi.
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@mariozechner/pi-coding-agent";
 // TypeBox is used to declare the JSON-Schema shapes of tool parameters.
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 // spawnSync runs a child process and blocks until it finishes.
 import { spawnSync } from "node:child_process";
 // `fs.promises` for async file I/O; `readFileSync` for the one synchronous
