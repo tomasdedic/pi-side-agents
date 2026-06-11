@@ -1891,17 +1891,34 @@ function tmuxInterrupt(windowId: string): void {
 	run("tmux", ["send-keys", "-t", windowId, "C-c"]);
 }
 
-// Pastes `prompt` into the tmux pane via the tmux buffer (handles multi-line
-// text safely without shell escaping issues) and presses Enter.
+// Sends `prompt` into the tmux pane and presses Enter.
+//
+// For single-line prompts we prefer literal key injection (`send-keys -l`) over
+// paste-buffer because some Pi/TUI states can leave paste-buffer text in the
+// editor without submitting it. Literal typing is slower but more reliable for
+// short steering messages.
+//
+// For multiline prompts we keep using paste-buffer to preserve line breaks.
 function tmuxSendPrompt(windowId: string, prompt: string): void {
+	const normalized = prompt.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+	if (!normalized.includes("\n")) {
+		const typed = run("tmux", ["send-keys", "-t", windowId, "-l", normalized]);
+		if (typed.ok) {
+			runOrThrow("tmux", ["send-keys", "-t", windowId, "Enter"]);
+			return;
+		}
+		// Fall through to paste-buffer path if literal typing fails.
+	}
+
 	// Load the text into tmux's paste buffer via stdin.
-	const loaded = run("tmux", ["load-buffer", "-"], { input: prompt });
+	const loaded = run("tmux", ["load-buffer", "-"], { input: normalized });
 	if (!loaded.ok) {
 		throw new Error(`Failed to send input to tmux window ${windowId}: ${loaded.stderr || loaded.error || "unknown error"}`);
 	}
 	// Paste the buffer into the pane, then press Enter.
 	runOrThrow("tmux", ["paste-buffer", "-d", "-t", windowId]);
-	runOrThrow("tmux", ["send-keys", "-t", windowId, "C-m"]);
+	runOrThrow("tmux", ["send-keys", "-t", windowId, "Enter"]);
 }
 
 // Captures the last TMUX_BACKLOG_CAPTURE_LINES lines of scrollback from the
