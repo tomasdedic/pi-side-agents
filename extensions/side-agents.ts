@@ -1757,11 +1757,7 @@ iso_now() {
 
 write_exit() {
   local code="$1"
-<<<<<<< HEAD
   printf '{"exitCode":%d,"finishedAt":"%s"}\n' "$code" "$(iso_now)" > "$EXIT_FILE"
-=======
-  printf '{"exitCode":%d,"finishedAt":"%s"}\n' "$code" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$EXIT_FILE"
->>>>>>> c925d1a (fix date command portability for side-agent scripts)
 }
 
 cd "$WORKTREE"

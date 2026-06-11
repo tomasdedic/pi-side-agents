@@ -1086,11 +1086,7 @@ iso_now() {
 
 acquire_lock() {
   local payload started elapsed
-<<<<<<< HEAD
   payload="{\"agentId\":\"$AGENT_ID\",\"pid\":$$,\"acquiredAt\":\"$(iso_now)\"}"
-=======
-  payload="{\"agentId\":\"$AGENT_ID\",\"pid\":$$,\"acquiredAt\":\"$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")\"}"
->>>>>>> c925d1a (fix date command portability for side-agent scripts)
   started=$(date +%s)
   while true; do
     if ( set -o noclobber; printf '%s\\n' "$payload" > "$LOCK_FILE" ) 2>/dev/null; then
